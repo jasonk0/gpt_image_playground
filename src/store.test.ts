@@ -1731,6 +1731,132 @@ describe('agent context for removed outputs', () => {
   })
 })
 
+describe('agent built-in image tool failure', () => {
+  const responsesProfile = createDefaultOpenAIProfile({
+    id: 'responses-profile',
+    apiKey: 'test-key',
+    apiMode: 'responses',
+    model: DEFAULT_RESPONSES_MODEL,
+    streamImages: true,
+  })
+
+  beforeEach(async () => {
+    await clearTasks()
+    await clearImages()
+    await clearAgentConversations()
+    vi.mocked(callAgentResponsesApi).mockClear()
+    useStore.setState({
+      settings: normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        apiKey: 'test-key',
+        apiMode: 'responses',
+        model: DEFAULT_RESPONSES_MODEL,
+        streamImages: true,
+        profiles: [responsesProfile],
+        activeProfileId: responsesProfile.id,
+      }),
+      prompt: '画一张图',
+      inputImages: [],
+      maskDraft: null,
+      params: { ...DEFAULT_PARAMS },
+      appMode: 'agent',
+      tasks: [],
+      streamPreviews: {},
+      streamPreviewSlots: {},
+      agentConversations: [agentConversation({
+        id: 'conversation-a',
+        activeRoundId: null,
+        rounds: [],
+        messages: [],
+      })],
+      activeAgentConversationId: 'conversation-a',
+      agentEditingRoundId: null,
+      showToast: vi.fn(),
+    })
+  })
+
+  it('marks a started built-in image task as error when the stream fails', async () => {
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-fail' })
+      await opts.onImagePartialImage?.({
+        toolCallId: 'ig-fail',
+        image: 'data:image/png;base64,cGFydGlhbA==',
+        partialImageIndex: 0,
+      })
+      throw new Error('image_generation failed')
+    })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 10 && useStore.getState().tasks[0]?.status !== 'error'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const state = useStore.getState()
+    const failedTask = state.tasks[0]
+    expect(failedTask).toMatchObject({
+      status: 'error',
+      error: 'image_generation failed',
+      agentToolCallId: 'ig-fail',
+      sourceMode: 'agent',
+    })
+    expect(state.streamPreviews[failedTask.id]).toBeUndefined()
+    expect(state.streamPreviewSlots[failedTask.id]).toBeUndefined()
+
+    const round = state.agentConversations[0].rounds[0]
+    expect(round).toMatchObject({
+      status: 'error',
+      error: 'image_generation failed',
+      outputTaskIds: [failedTask.id],
+    })
+  })
+
+  it('marks a failed built-in image task as error while the Agent stream continues', async () => {
+    vi.mocked(callAgentResponsesApi).mockImplementationOnce(async (opts) => {
+      await opts.onImageToolStarted?.({ toolCallId: 'ig-fail' })
+      await opts.onImagePartialImage?.({
+        toolCallId: 'ig-fail',
+        image: 'data:image/png;base64,cGFydGlhbA==',
+        partialImageIndex: 0,
+      })
+      await opts.onImageToolFailed?.({ toolCallId: 'ig-fail', error: 'safety rejected' })
+      opts.onTextDelta?.('图片失败，但回复继续。')
+      return {
+        text: '图片失败，但回复继续。',
+        images: [],
+        outputItems: [{ type: 'message', content: [{ type: 'output_text', text: '图片失败，但回复继续。' }] }],
+        responseId: 'response-continued',
+      }
+    })
+
+    await submitAgentMessage()
+    for (let i = 0; i < 10 && useStore.getState().agentConversations[0].rounds[0]?.status !== 'done'; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0))
+    }
+
+    const state = useStore.getState()
+    const failedTask = state.tasks[0]
+    expect(failedTask).toMatchObject({
+      status: 'error',
+      error: 'safety rejected',
+      agentToolCallId: 'ig-fail',
+      sourceMode: 'agent',
+    })
+    expect(state.streamPreviews[failedTask.id]).toBeUndefined()
+    expect(state.streamPreviewSlots[failedTask.id]).toBeUndefined()
+
+    const round = state.agentConversations[0].rounds[0]
+    expect(round).toMatchObject({
+      status: 'done',
+      error: null,
+      outputTaskIds: [failedTask.id],
+    })
+    expect(state.agentConversations[0].messages.find((message) => message.role === 'assistant')).toMatchObject({
+      content: '图片失败，但回复继续。',
+      outputTaskIds: [failedTask.id],
+    })
+  })
+})
+
 describe('agent batch reference resolution', () => {
   const responsesProfile = createDefaultOpenAIProfile({
     id: 'responses-profile',

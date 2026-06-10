@@ -10,6 +10,11 @@ export interface AgentApiResultImage {
   revisedPrompt?: string
 }
 
+export interface AgentApiImageToolFailure {
+  toolCallId: string
+  error: string
+}
+
 export interface AgentApiResult {
   responseId?: string
   text: string
@@ -258,6 +263,34 @@ function getStreamEventErrorMessage(event: Record<string, unknown>): string | nu
   return null
 }
 
+function getErrorMessageFromValue(value: unknown): string | null {
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  if (!isRecordValue(value)) return null
+
+  return getStringValue(value, 'message')
+    ?? getStringValue(value, 'code')
+    ?? null
+}
+
+function getImageToolFailureFromOutputItem(event: Record<string, unknown>, item?: ResponsesOutputItem): AgentApiImageToolFailure | null {
+  if (item?.type !== 'image_generation_call' || item.status !== 'failed') return null
+
+  const toolCallId = (typeof item?.id === 'string' && item.id)
+    || getStringValue(event, 'item_id')
+  if (!toolCallId) return null
+
+  const itemRecord = item as Record<string, unknown> | undefined
+  const error = getErrorMessageFromValue(itemRecord?.error)
+    ?? getErrorMessageFromValue(event.error)
+    ?? getStringValue(event, 'message')
+    ?? '内置 image_generation 工具调用失败'
+
+  return {
+    toolCallId,
+    error,
+  }
+}
+
 function parseServerSentEventBlock(block: string): string | null {
   const dataLines: string[] = []
   for (const line of block.split(/\r?\n/)) {
@@ -472,6 +505,7 @@ async function parseAgentStreamResponse(
   onImageToolStarted?: (event: { toolCallId: string; outputIndex?: number }) => void | Promise<void>,
   onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => void | Promise<void>,
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>,
+  onImageToolFailed?: (event: AgentApiImageToolFailure) => void | Promise<void>,
 ): Promise<AgentApiResult> {
   let completedPayload: ResponsesApiResponse | null = null
   const outputItems: ResponsesOutputItem[] = []
@@ -567,6 +601,12 @@ async function parseAgentStreamResponse(
 
     if (type === 'response.output_item.done') {
       const item = payload.output?.[0]
+      const imageFailure = getImageToolFailureFromOutputItem(event, item)
+      if (imageFailure) {
+        await onImageToolFailed?.(imageFailure)
+        return
+      }
+
       const image = item ? extractImageFromOutputItem(item, mime) : null
       if (image) await onImageToolCompleted?.(image)
       return
@@ -603,8 +643,9 @@ export async function callAgentResponsesApi(opts: {
   onImageToolStarted?: (event: { toolCallId: string; outputIndex?: number }) => void | Promise<void>
   onImagePartialImage?: (event: { toolCallId: string; image: string; partialImageIndex?: number; outputIndex?: number }) => void | Promise<void>
   onImageToolCompleted?: (image: AgentApiResultImage) => void | Promise<void>
+  onImageToolFailed?: (event: AgentApiImageToolFailure) => void | Promise<void>
 }): Promise<AgentApiResult> {
-  const { settings, profile, params, input, maskDataUrl, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted } = opts
+  const { settings, profile, params, input, maskDataUrl, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted, onImageToolFailed } = opts
   const mime = MIME_MAP[params.output_format] || 'image/png'
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
@@ -639,7 +680,7 @@ export async function callAgentResponsesApi(opts: {
     }
 
     if (profile.streamImages && isEventStreamResponse(response)) {
-      return parseAgentStreamResponse(response, mime, controller.signal, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted)
+      return parseAgentStreamResponse(response, mime, controller.signal, signal, onTextDelta, onOutputItems, onImageToolStarted, onImagePartialImage, onImageToolCompleted, onImageToolFailed)
     }
 
     const payload = await response.json() as ResponsesApiResponse

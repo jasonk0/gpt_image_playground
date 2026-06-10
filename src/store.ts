@@ -2434,6 +2434,36 @@ function markAgentRoundTasksStopped(conversationId: string, roundId: string, now
   return runningTasks.length > 0
 }
 
+function markAgentRoundTasksFailed(
+  conversationId: string,
+  roundId: string,
+  error: string,
+  rawResponsePayload?: string,
+  shouldFailTask: (task: TaskRecord) => boolean = () => true,
+  now = Date.now(),
+) {
+  const runningTasks = useStore.getState().tasks.filter((task) =>
+    task.status === 'running' &&
+    task.agentConversationId === conversationId &&
+    task.agentRoundId === roundId &&
+    shouldFailTask(task),
+  )
+
+  for (const task of runningTasks) {
+    useStore.getState().setTaskStreamPreview(task.id)
+    updateTaskInStore(task.id, {
+      status: 'error',
+      error,
+      ...(rawResponsePayload ? { rawResponsePayload } : {}),
+      falRecoverable: false,
+      customRecoverable: false,
+      finishedAt: now,
+      elapsed: Math.max(0, now - task.createdAt),
+    })
+  }
+  return runningTasks.length > 0
+}
+
 function markAgentRoundStopped(conversationId: string, roundId: string) {
   const now = Date.now()
   const stoppedTasks = markAgentRoundTasksStopped(conversationId, roundId, now)
@@ -3759,6 +3789,14 @@ async function executeAgentRound(
               await completeAgentImageTask(image)
             }
           : undefined,
+        onImageToolFailed: shouldStreamAssistantMessage
+          ? async ({ toolCallId, error }) => {
+              if (controller.signal.aborted) return
+              await ensureStreamingAgentTask(toolCallId)
+              if (controller.signal.aborted) return
+              failAgentImageTask(toolCallId, error)
+            }
+          : undefined,
       })
       if (controller.signal.aborted) throw createAgentAbortError()
 
@@ -3923,6 +3961,14 @@ async function executeAgentRound(
       pendingToolTextSeparator = true
     }
 
+    markAgentRoundTasksFailed(
+      conversationId,
+      roundId,
+      '内置 image_generation 工具未返回图片',
+      undefined,
+      (task) => Boolean(task.agentToolCallId && !task.agentBatchCallId),
+    )
+
     const taskIds: string[] = [...streamingTaskIds]
     const outputIds = taskIds.flatMap((taskId) => useStore.getState().tasks.find((task) => task.id === taskId)?.outputImages ?? [])
     const limitNotice = reachedToolLimit ? `已达到最大工具调用次数（${maxToolCalls}），已停止自动续跑。` : ''
@@ -3982,6 +4028,8 @@ async function executeAgentRound(
     if (networkErrorHint && !message.includes(IMAGE_FETCH_CORS_HINT)) {
       message += `\n${networkErrorHint}`
     }
+
+    markAgentRoundTasksFailed(conversationId, roundId, message, getRawErrorPayload(err).rawResponsePayload)
 
     updateAgentConversation(conversationId, (current) => {
       const failedRound = current.rounds.find((round) => round.id === roundId)
